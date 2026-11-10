@@ -136,6 +136,100 @@ combining `frame: false` with `win.setWindowButtonVisibility(true)` will yield t
 layout outcome as setting `titleBarStyle: 'hidden'`.
 :::
 
+#### Fullscreen custom title bars _macOS_
+
+By default, macOS reveals its own title bar when the pointer reaches the top edge
+of a fullscreen window, and the Window Controls Overlay is disabled. To make a
+custom title bar follow the menu bar's reveal animation, set `fullscreen` in the
+`titleBarOverlay` constructor options:
+
+```js title='main.js'
+const { BrowserWindow } = require('electron')
+const path = require('node:path')
+
+const win = new BrowserWindow({
+  titleBarStyle: 'hidden',
+  titleBarOverlay: {
+    height: 40,
+    fullscreen: 'trafficLights'
+  },
+  webPreferences: {
+    preload: path.join(__dirname, 'preload.js')
+  }
+})
+
+win.on('window-controls-overlay-changed', (_event, _bounds, overlaid) => {
+  win.webContents.send('titlebar-overlaid', overlaid)
+})
+```
+
+Choose `native` to keep the system title bar and place the custom title bar below
+it, or `trafficLights` to hide the system title bar and slide the native traffic
+lights horizontally into the custom title bar. Both modes are opt-in and require
+`titleBarStyle: 'hidden'` or `'hiddenInset'` on a local window, without `appShim`.
+After opting in through the constructor, switch between the two modes with
+`win.setTitleBarOverlay({ fullscreen: 'native' })` or
+`win.setTitleBarOverlay({ fullscreen: 'trafficLights' })`. This also works while
+fullscreen, so an app can restore the native title bar while its custom chrome
+is hidden. Calling the setter cannot opt in a window that omitted the
+constructor option.
+
+Position the title bar using the existing Window Controls Overlay CSS environment
+variables. Keep the file or page content in place so the revealed title bar
+overlays it rather than changing its layout:
+
+```css
+#titlebar {
+  position: fixed;
+  top: env(titlebar-area-y, 0px);
+  height: env(titlebar-area-height, 40px);
+  width: 100%;
+  background: rgb(173 216 230 / 70%);
+  app-region: drag;
+}
+
+#titlebar-content {
+  margin-left: env(titlebar-area-x, 0px);
+  width: env(titlebar-area-width, 100%);
+}
+
+.titlebar-overlaid #titlebar {
+  background: #add8e6;
+}
+```
+
+The event's `overlaid` argument explicitly reports when the custom title bar is
+covering content. Forward it to the renderer to make the title bar opaque during
+the reveal. Use that state instead of inferring it from the rectangle or window
+button visibility:
+
+```js title='preload.js'
+const { ipcRenderer } = require('electron')
+
+let overlaid = false
+const updateTitlebar = () => {
+  document.documentElement.classList.toggle('titlebar-overlaid', overlaid)
+}
+
+ipcRenderer.on('titlebar-overlaid', (_event, value) => {
+  overlaid = value
+  if (document.readyState !== 'loading') updateTitlebar()
+})
+window.addEventListener('DOMContentLoaded', updateTitlebar)
+```
+
+The overlay geometry also updates through
+`navigator.windowControlsOverlay`'s `geometrychange` event. Apps that place their
+title bar in a separate `WebContentsView` can use the window's
+[`window-controls-overlay-changed`](../api/base-window.md#event-window-controls-overlay-changed)
+event to obtain geometry relative to the window's content area.
+
+:::warning Mac App Store
+These modes use private macOS APIs and are unavailable in Mac App Store builds of
+Electron (`is_mas_build = true`). Requesting either mode in a Mac App Store build
+throws a `TypeError`; omitting the option preserves the existing behavior.
+:::
+
 #### Custom window controls
 
 The [Window Controls Overlay API][] is a web standard that gives web apps the ability to
