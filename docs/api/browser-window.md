@@ -360,6 +360,37 @@ Emitted when the window enters a full-screen state triggered by HTML API.
 
 Emitted when the window leaves a full-screen state triggered by HTML API.
 
+#### Event: 'window-controls-overlay-changed'
+
+<!--
+```YAML history
+added:
+  - pr-url: https://github.com/electron/electron/pull/55721
+```
+-->
+
+Returns:
+
+* `event` Event
+* `bounds` [Rectangle](structures/rectangle.md) - The area available for custom title bar content, in device-independent pixels relative to the window's content area.
+* `overlaid` boolean - Whether the custom title bar currently overlays other content during a native fullscreen reveal on macOS. Always `false` outside fullscreen, when the reveal is hidden, or when the fullscreen custom title bar feature is disabled. Always `false` on other platforms.
+
+Emitted when the Window Controls Overlay geometry or its fullscreen overlay state
+changes. The rectangle excludes the native window controls. An empty rectangle
+indicates that the overlay is not visible. The overlay must be enabled with the
+`titleBarOverlay` constructor option.
+
+Use `overlaid` to style custom chrome while it covers content, for example by
+making a translucent title bar opaque. This state is independent of the native
+buttons' visibility and the rounded rectangle coordinates. A state change can
+emit this event even when `bounds` has not changed.
+
+Use this event to position a custom title bar implemented in a separate
+[`WebContentsView`](web-contents-view.md). Its coordinates remain relative to the
+window, even when the view moves. In a renderer, use
+`navigator.windowControlsOverlay` and the `titlebar-area-*` CSS environment
+variables instead; those coordinates are translated and clipped to that view.
+
 #### Event: 'always-on-top-changed'
 
 Returns:
@@ -1852,16 +1883,32 @@ with `addBrowserView` or `setBrowserView`. The top-most BrowserView is the last 
 > The `BrowserView` class is deprecated, and replaced by the new
 > [`WebContentsView`](web-contents-view.md) class.
 
-#### `win.setTitleBarOverlay(options)` _Windows_ _Linux_
+#### `win.setTitleBarOverlay(options)`
+
+<!--
+```YAML history
+changes:
+  - pr-url: https://github.com/electron/electron/pull/55721
+    description: "Added macOS fullscreen custom title bar mode updates."
+```
+-->
 
 * `options` Object
-  * `color` String (optional) - The CSS color of the Window Controls Overlay when enabled.
-  * `symbolColor` String (optional) - The CSS color of the symbols on the Window Controls Overlay when enabled.
-  * `height` Integer (optional) - The height of the title bar and Window Controls Overlay in pixels.
+  * `color` String (optional) _Windows_ _Linux_ - The CSS color of the Window Controls Overlay when enabled.
+  * `symbolColor` String (optional) _Windows_ _Linux_ - The CSS color of the symbols on the Window Controls Overlay when enabled.
+  * `height` Integer (optional) _Windows_ _Linux_ - The height of the title bar and Window Controls Overlay in pixels.
+  * `fullscreen` string (optional) _macOS_ - The fullscreen custom title bar mode. Can be `native` or `trafficLights`. Omitting it leaves the mode unchanged.
 
 On a window with Window Controls Overlay already enabled, this method updates the style of the title bar overlay.
 
 On Linux, the `symbolColor` is automatically calculated to have minimum accessible contrast to the `color` if not explicitly set.
+
+On macOS, only `fullscreen` can be updated. The window must have opted in with
+`titleBarOverlay.fullscreen` in its constructor; this method cannot enable the
+feature on an existing window. The mode can be switched while the window is
+fullscreen, for example to restore the native title bar while hiding an app's
+custom chrome. An invalid mode, a window without constructor opt-in, or a Mac
+App Store build throws a `TypeError`.
 
 [page-visibility-api]: https://developer.mozilla.org/en-US/docs/Web/API/Page_Visibility_API
 [quick-look]: https://en.wikipedia.org/wiki/Quick_Look

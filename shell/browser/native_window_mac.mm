@@ -20,6 +20,7 @@
 #include "components/remote_cocoa/browser/scoped_cg_window_id.h"
 #include "content/public/browser/browser_thread.h"
 #include "content/public/browser/desktop_media_id.h"
+#include "gin/arguments.h"
 #include "shell/browser/browser.h"
 #include "shell/browser/javascript_environment.h"
 #include "shell/browser/native_window_mac_remote.h"
@@ -48,6 +49,10 @@
 #include "ui/views/view_targeter.h"
 #include "ui/views/widget/widget.h"
 #include "ui/views/window/native_frame_view_mac.h"
+
+#if !IS_MAS_BUILD()
+#include "components/remote_cocoa/app_shim/immersive_mode_transparent_titlebar_controller_cocoa.h"
+#endif
 
 @interface ElectronProgressBar : NSProgressIndicator
 @end
@@ -272,6 +277,15 @@ NativeWindowMac::NativeWindowMac(const int32_t base_window_id,
       }
     }
   }
+
+#if !IS_MAS_BUILD()
+  gin_helper::Dictionary overlay;
+  std::string fullscreen_mode;
+  if (options.Get(options::ktitleBarOverlay, &overlay) &&
+      overlay.Get(options::kFullscreen, &fullscreen_mode)) {
+    fullscreen_titlebar_native_ = fullscreen_mode == "native";
+  }
+#endif
 
   // Create a tab only if tabbing identifier is specified and window has
   // a native title bar.
@@ -1477,6 +1491,31 @@ void NativeWindowMac::SetVibrancy(const std::string& type, int duration) {
   }
 }
 
+void NativeWindowMac::SetTitleBarOverlay(const gin_helper::Dictionary& options,
+                                         gin::Arguments* args) {
+#if IS_MAS_BUILD()
+  args->ThrowTypeError(
+      "titleBarOverlay.fullscreen is only available in non-MAS macOS builds");
+#else
+  if (!fullscreen_titlebar_native_.has_value()) {
+    args->ThrowTypeError("Fullscreen titlebar overlay is not enabled");
+    return;
+  }
+  v8::Local<v8::Value> value;
+  if (!options.Get(options::kFullscreen, &value) || value->IsUndefined())
+    return;
+  std::string mode;
+  if (!gin::ConvertFromV8(options.isolate(), value, &mode) ||
+      (mode != "native" && mode != "trafficLights")) {
+    args->ThrowTypeError(
+        "titleBarOverlay.fullscreen must be 'native' or 'trafficLights'");
+    return;
+  }
+  fullscreen_titlebar_native_ = mode == "native";
+  UpdateFullscreenTitlebar();
+#endif
+}
+
 void NativeWindowMac::SetWindowButtonVisibility(bool visible) {
   window_button_visibility_ = visible;
   if (buttons_proxy_) {
@@ -1488,6 +1527,10 @@ void NativeWindowMac::SetWindowButtonVisibility(bool visible) {
   if (title_bar_style() != TitleBarStyle::kCustomButtonsOnHover)
     InternalSetWindowButtonVisibility(visible);
 
+#if !IS_MAS_BUILD()
+  if (fullscreen_titlebar_controller_)
+    fullscreen_titlebar_controller_->OnTitlebarGeometryChanged();
+#endif
   NotifyLayoutWindowControlsOverlay();
 }
 
@@ -1502,6 +1545,13 @@ void NativeWindowMac::SetWindowButtonPosition(
   traffic_light_position_ = position;
   if (buttons_proxy_) {
     [buttons_proxy_ setMargin:traffic_light_position_];
+#if !IS_MAS_BUILD()
+    if (fullscreen_titlebar_controller_) {
+      fullscreen_titlebar_controller_->OnTopViewBoundsChanged(gfx::Rect(
+          0, 0, GetContentSize().width(), GetEffectiveTitlebarOverlayHeight()));
+      fullscreen_titlebar_controller_->OnTitlebarGeometryChanged();
+    }
+#endif
     NotifyLayoutWindowControlsOverlay();
   }
 }
@@ -1658,16 +1708,28 @@ gfx::Rect NativeWindowMac::WindowBoundsToContentBounds(
 }
 
 void NativeWindowMac::NotifyWindowEnterFullScreen() {
+#if !IS_MAS_BUILD()
+  if (fullscreen_titlebar_controller_) {
+    UpdateFullscreenTitlebar();
+    fullscreen_titlebar_controller_->FullscreenTransitionCompleted();
+    NativeWindow::NotifyWindowEnterFullScreen();
+    return;
+  }
+#endif
   NativeWindow::NotifyWindowEnterFullScreen();
   // Restore the window title under fullscreen mode.
   if (buttons_proxy_)
     [window_ setTitleVisibility:NSWindowTitleVisible];
-
   if (transparent() || !has_frame())
     [window_ setTitlebarAppearsTransparent:NO];
 }
 
 void NativeWindowMac::NotifyWindowLeaveFullScreen() {
+#if !IS_MAS_BUILD()
+  if (fullscreen_titlebar_native_.has_value())
+    remote_cocoa::ImmersiveModeTransparentTitlebarControllerCocoa::
+        ResetTitlebarTransparency(window_);
+#endif
   NativeWindow::NotifyWindowLeaveFullScreen();
   // Restore window buttons.
   if (buttons_proxy_ && window_button_visibility_.value_or(true)) {
@@ -1680,10 +1742,30 @@ void NativeWindowMac::NotifyWindowLeaveFullScreen() {
 }
 
 void NativeWindowMac::NotifyWindowWillEnterFullScreen() {
+#if !IS_MAS_BUILD()
+  if (fullscreen_titlebar_native_.has_value()) {
+    fullscreen_titlebar_controller_ = std::make_unique<
+        remote_cocoa::ImmersiveModeTransparentTitlebarControllerCocoa>(
+        window_, base::DoNothing(),
+        base::BindRepeating(
+            [](base::WeakPtr<NativeWindow> window, const gfx::RectF& frame,
+               double reveal) {
+              if (window && !window->IsClosed())
+                static_cast<NativeWindowMac*>(window.get())
+                    ->OnFullscreenTitlebarGeometry(frame, reveal);
+            },
+            GetWeakPtr()));
+    fullscreen_titlebar_controller_->Init();
+    UpdateFullscreenTitlebar();
+  }
+#endif
   UpdateVibrancyRadii(true);
 }
 
 void NativeWindowMac::NotifyWindowDidFailToEnterFullScreen() {
+#if !IS_MAS_BUILD()
+  ResetFullscreenTitlebar();
+#endif
   UpdateVibrancyRadii(false);
 
   if (buttons_proxy_)
@@ -1691,6 +1773,9 @@ void NativeWindowMac::NotifyWindowDidFailToEnterFullScreen() {
 }
 
 void NativeWindowMac::NotifyWindowWillLeaveFullScreen() {
+#if !IS_MAS_BUILD()
+  ResetFullscreenTitlebar();
+#endif
   if (buttons_proxy_) {
     // Hide window title when leaving fullscreen.
     [window_ setTitleVisibility:NSWindowTitleHidden];
@@ -1710,6 +1795,9 @@ bool NativeWindowMac::IsActive() const {
 
 void NativeWindowMac::Cleanup() {
   DCHECK(!IsClosed());
+#if !IS_MAS_BUILD()
+  ResetFullscreenTitlebar();
+#endif
   ui::NativeTheme::GetInstanceForNativeUi()->RemoveObserver(this);
   display::Screen::Get()->RemoveObserver(this);
   [window_ cleanup];
@@ -1833,6 +1921,80 @@ void NativeWindowMac::SetForwardMouseMessages(bool forward) {
   [window_ setAcceptsMouseMovedEvents:forward];
 }
 
+#if !IS_MAS_BUILD()
+void NativeWindowMac::UpdateFullscreenTitlebar() {
+  if (!fullscreen_titlebar_controller_)
+    return;
+  const bool native = *fullscreen_titlebar_native_;
+  if (!is_transitioning_fullscreen() && IsFullscreen()) {
+    window_.titleVisibility =
+        native ? NSWindowTitleVisible : NSWindowTitleHidden;
+    window_.titlebarAppearsTransparent = !native;
+  }
+  [buttons_proxy_ setFullscreenOverlay:YES reveal:std::nullopt];
+  [buttons_proxy_ setVisible:window_button_visibility_.value_or(true)];
+  fullscreen_titlebar_controller_->OnTopViewBoundsChanged(gfx::Rect(
+      0, 0, GetContentSize().width(), GetEffectiveTitlebarOverlayHeight()));
+  fullscreen_titlebar_controller_->UpdateToolbarVisibility(
+      native ? remote_cocoa::mojom::ToolbarVisibilityStyle::kNone
+             : remote_cocoa::mojom::ToolbarVisibilityStyle::kAutohide);
+  fullscreen_titlebar_controller_->OnTitlebarGeometryChanged();
+}
+
+void NativeWindowMac::ResetFullscreenTitlebar() {
+  fullscreen_titlebar_controller_.reset();
+  [buttons_proxy_ setFullscreenOverlay:NO reveal:std::nullopt];
+  fullscreen_titlebar_rect_ = gfx::Rect();
+  fullscreen_titlebar_overlaid_ = false;
+}
+
+void NativeWindowMac::OnFullscreenTitlebarGeometry(const gfx::RectF& frame,
+                                                   double reveal) {
+  const bool native = *fullscreen_titlebar_native_;
+  [buttons_proxy_ setFullscreenOverlay:YES
+                                reveal:native ? std::nullopt
+                                              : std::optional<double>(reveal)];
+  const double offset = std::max(0.0f, native ? frame.bottom() : frame.y());
+  const int inset =
+      native || !window_button_visibility_.value_or(true)
+          ? 0
+          : std::round(NSWidth([buttons_proxy_ getButtonsContainerBounds]) *
+                       reveal);
+  const gfx::Rect rect(base::i18n::IsRTL() ? 0 : inset, std::round(offset),
+                       GetContentSize().width() - inset,
+                       GetEffectiveTitlebarOverlayHeight());
+  const bool overlaid = offset > 0 || reveal > 0;
+  if (rect == fullscreen_titlebar_rect_ &&
+      overlaid == fullscreen_titlebar_overlaid_)
+    return;
+  fullscreen_titlebar_rect_ = rect;
+  fullscreen_titlebar_overlaid_ = overlaid;
+  // App code can close the window. Notify after the controller's AppKit
+  // mutations return, so callbacks cannot delete it in the middle of a layout.
+  content::GetUIThreadTaskRunner({})->PostTask(
+      FROM_HERE, base::BindOnce(
+                     [](base::WeakPtr<NativeWindow> window) {
+                       if (window && !window->IsClosed())
+                         window->NotifyLayoutWindowControlsOverlay();
+                     },
+                     GetWeakPtr()));
+}
+#endif
+
+int NativeWindowMac::GetEffectiveTitlebarOverlayHeight() const {
+  return [buttons_proxy_ useCustomHeight]
+             ? titlebar_overlay_height()
+             : NSHeight([buttons_proxy_ getButtonsContainerBounds]);
+}
+
+bool NativeWindowMac::IsTitleBarOverlayOverlaid() const {
+#if !IS_MAS_BUILD()
+  return IsFullscreen() && fullscreen_titlebar_overlaid_;
+#else
+  return false;
+#endif
+}
+
 std::optional<gfx::Rect> NativeWindowMac::GetWindowControlsOverlayRect() {
   if (!titlebar_overlay_)
     return std::nullopt;
@@ -1840,18 +2002,22 @@ std::optional<gfx::Rect> NativeWindowMac::GetWindowControlsOverlayRect() {
   // On macOS, when in fullscreen mode, window controls (the menu bar, title
   // bar, and toolbar) are attached to a separate NSView that slides down from
   // the top of the screen, independent of, and overlapping the WebContents.
-  // Disable WCO when in fullscreen, because this space is inaccessible to
-  // WebContents. https://crbug.com/915110.
-  if (IsFullscreen())
+  // Preserve the legacy empty WCO area unless the app explicitly opted into
+  // following the native reveal with its custom titlebar.
+  // https://crbug.com/915110.
+  if (IsFullscreen()) {
+#if !IS_MAS_BUILD()
+    if (fullscreen_titlebar_controller_)
+      return fullscreen_titlebar_rect_;
+#endif
     return gfx::Rect();
+  }
 
   if (buttons_proxy_ && window_button_visibility_.value_or(true)) {
     NSRect buttons = [buttons_proxy_ getButtonsContainerBounds];
     gfx::Rect overlay;
     overlay.set_width(GetContentSize().width() - NSWidth(buttons));
-    overlay.set_height([buttons_proxy_ useCustomHeight]
-                           ? titlebar_overlay_height()
-                           : NSHeight(buttons));
+    overlay.set_height(GetEffectiveTitlebarOverlayHeight());
 
     if (!base::i18n::IsRTL())
       overlay.set_x(NSMaxX(buttons));

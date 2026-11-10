@@ -47,6 +47,16 @@
 }
 
 - (void)setVisible:(BOOL)visible {
+  if (fullscreen_overlay_) {
+    [self titleBarContainer].hidden = NO;
+    for (NSWindowButton kind :
+         {NSWindowCloseButton, NSWindowMiniaturizeButton, NSWindowZoomButton}) {
+      NSButton* button = [window_ standardWindowButton:kind];
+      if (button.hidden == visible)
+        button.hidden = !visible;
+    }
+    return;
+  }
   NSView* titleBarContainer = [self titleBarContainer];
   if (!titleBarContainer)
     return;
@@ -79,10 +89,7 @@
 }
 
 - (void)setMargin:(const std::optional<gfx::Point>&)margin {
-  if (margin)
-    margin_ = *margin;
-  else
-    margin_ = default_margin_;
+  margin_ = margin.value_or(default_margin_);
   [self redraw];
 }
 
@@ -95,6 +102,31 @@
   NSView* left = [self leftButton];
   float button_height = NSHeight(left.frame);
   return height_ > button_height + 2 * default_margin_.y();
+}
+
+- (void)restoreFullscreenTitlebar {
+  NSView* parent = fullscreen_titlebar_view_;
+  if (!parent)
+    return;
+  NSRect frame = parent.frame;
+  frame.origin.x = fullscreen_titlebar_origin_.x;
+  frame.origin.y = parent.superview.flipped
+                       ? fullscreen_titlebar_origin_.y
+                       : NSHeight(parent.superview.bounds) - NSHeight(frame) -
+                             fullscreen_titlebar_origin_.y;
+  parent.frame = frame;
+}
+
+- (void)setFullscreenOverlay:(BOOL)enabled
+                      reveal:(std::optional<double>)reveal {
+  fullscreen_overlay_ = enabled;
+  fullscreen_reveal_ = reveal;
+  if (!reveal) {
+    [self restoreFullscreenTitlebar];
+    fullscreen_titlebar_view_ = nil;
+  }
+  if (enabled)
+    [self redraw];
 }
 
 - (NSRect)getButtonsContainerBounds {
@@ -113,6 +145,43 @@
   float button_width = NSWidth(left.frame);
   float button_height = NSHeight(left.frame);
   float padding = NSMinX(middle.frame) - NSMaxX(left.frame);
+  if (fullscreen_overlay_) {
+    if (!fullscreen_reveal_)
+      return;
+    NSView* parent = left.superview;
+    if (fullscreen_titlebar_view_ != parent) {
+      [self restoreFullscreenTitlebar];
+      fullscreen_titlebar_view_ = parent;
+      fullscreen_titlebar_origin_ = NSMakePoint(
+          NSMinX(parent.frame),
+          parent.superview.flipped
+              ? NSMinY(parent.frame)
+              : NSHeight(parent.superview.bounds) - NSMaxY(parent.frame));
+    }
+    const CGFloat controls_width =
+        NSWidth([self getButtonsBounds]) + 2 * margin_.x();
+    const CGFloat slide = controls_width * (1 - *fullscreen_reveal_);
+    NSRect frame = parent.frame;
+    frame.origin.x = base::i18n::IsRTL()
+                         ? NSWidth(parent.superview.bounds) - margin_.x() +
+                               slide - NSMaxX(right.frame)
+                         : margin_.x() - slide - NSMinX(left.frame);
+    const CGFloat height =
+        [self useCustomHeight] ? height_ : button_height + 2 * margin_.y();
+    const CGFloat button_top =
+        parent.flipped ? NSMinY(left.frame)
+                       : NSHeight(parent.bounds) - NSMaxY(left.frame);
+    const CGFloat desired_top = margin_.y() != default_margin_.y()
+                                    ? margin_.y()
+                                    : (height - button_height) / 2;
+    const CGFloat top = desired_top - button_top;
+    frame.origin.y =
+        parent.superview.flipped
+            ? top
+            : NSHeight(parent.superview.bounds) - NSHeight(frame) - top;
+    parent.frame = frame;
+    return;
+  }
   float start;
   if (base::i18n::IsRTL())
     start =

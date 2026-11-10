@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Harry Twyford <htwyford@figma.com>
+Date: Tue, 10 Nov 2026 14:34:01 -0500
+Subject: feat: expose raw fullscreen titlebar reveal geometry
+
+Allow in-process hosts of custom fullscreen chrome to receive unrounded titlebar geometry and the native reveal fraction, without changing existing frame-only callers. Copy callbacks before notifying hosts so either notification may release the controller.
+
+diff --git a/components/remote_cocoa/app_shim/immersive_mode_transparent_titlebar_controller_cocoa.h b/components/remote_cocoa/app_shim/immersive_mode_transparent_titlebar_controller_cocoa.h
+index 245168eb6a469e0641e40990bcbd95709184c13e..fb4b5b1aa20233a8a2de6111b9bf9accbc7d1872 100644
+--- a/components/remote_cocoa/app_shim/immersive_mode_transparent_titlebar_controller_cocoa.h
++++ b/components/remote_cocoa/app_shim/immersive_mode_transparent_titlebar_controller_cocoa.h
+@@ -14,6 +14,7 @@
+ #include "components/remote_cocoa/app_shim/remote_cocoa_app_shim_export.h"
+ #include "components/remote_cocoa/common/native_widget_ns_window.mojom-shared.h"
+ #include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/rect_f.h"
+ 
+ @class ImmersiveModeTransparentTitlebarViewController;
+ 
+@@ -58,9 +59,16 @@ class REMOTE_COCOA_APP_SHIM_EXPORT
+   using TitlebarFrameChangedCallback =
+       base::RepeatingCallback<void(const gfx::Rect& frame)>;
+ 
++  // Optional notification with unrounded geometry and AppKit's reveal fraction.
++  // Unlike the frame-only callback, it runs even when rounding hides a change.
++  using TitlebarRevealChangedCallback =
++      base::RepeatingCallback<void(const gfx::RectF& frame,
++                                   double reveal_amount)>;
++
+   ImmersiveModeTransparentTitlebarControllerCocoa(
+       NSWindow* browser_window,
+-      TitlebarFrameChangedCallback titlebar_frame_changed_callback);
++      TitlebarFrameChangedCallback titlebar_frame_changed_callback,
++      TitlebarRevealChangedCallback titlebar_reveal_changed_callback = {});
+   ImmersiveModeTransparentTitlebarControllerCocoa(
+       const ImmersiveModeTransparentTitlebarControllerCocoa&) = delete;
+   ImmersiveModeTransparentTitlebarControllerCocoa& operator=(
+@@ -133,6 +141,7 @@ class REMOTE_COCOA_APP_SHIM_EXPORT
+   NSView* __weak titlebar_container_;
+ 
+   TitlebarFrameChangedCallback titlebar_frame_changed_callback_;
++  TitlebarRevealChangedCallback titlebar_reveal_changed_callback_;
+ 
+   // An empty and transparent titlebar accessory below the titlebar.
+   ImmersiveModeTransparentTitlebarViewController* __strong
+diff --git a/components/remote_cocoa/app_shim/immersive_mode_transparent_titlebar_controller_cocoa.mm b/components/remote_cocoa/app_shim/immersive_mode_transparent_titlebar_controller_cocoa.mm
+index 683258a2cbf5de87487a69ec409365a8a19061c0..c8a955634db7e6860b43f821e004ea63eb7c43f7 100644
+--- a/components/remote_cocoa/app_shim/immersive_mode_transparent_titlebar_controller_cocoa.mm
++++ b/components/remote_cocoa/app_shim/immersive_mode_transparent_titlebar_controller_cocoa.mm
+@@ -153,10 +153,13 @@ - (void)setRevealAmount:(double)revealAmount {
+ ImmersiveModeTransparentTitlebarControllerCocoa::
+     ImmersiveModeTransparentTitlebarControllerCocoa(
+         NSWindow* browser_window,
+-        TitlebarFrameChangedCallback titlebar_frame_changed_callback)
++        TitlebarFrameChangedCallback titlebar_frame_changed_callback,
++        TitlebarRevealChangedCallback titlebar_reveal_changed_callback)
+     : browser_window_(browser_window),
+       titlebar_frame_changed_callback_(
+           std::move(titlebar_frame_changed_callback)),
++      titlebar_reveal_changed_callback_(
++          std::move(titlebar_reveal_changed_callback)),
+       notification_observers_([[NSMutableArray alloc] init]) {
+   accessory_view_controller_ =
+       [[ImmersiveModeTransparentTitlebarViewController alloc]
+@@ -377,14 +380,25 @@ - (void)setRevealAmount:(double)revealAmount {
+   if (!content_view.flipped) {
+     frame.origin.y = NSHeight(content_view.bounds) - NSMaxY(frame);
+   }
+-  const gfx::Rect titlebar_frame =
+-      gfx::ToRoundedRect(gfx::RectF(NSRectToCGRect(frame)));
++  const gfx::RectF unrounded_frame(NSRectToCGRect(frame));
++  const gfx::Rect titlebar_frame = gfx::ToRoundedRect(unrounded_frame);
++  const bool frame_changed = last_reported_titlebar_frame_ != titlebar_frame;
++  last_reported_titlebar_frame_ = titlebar_frame;
+ 
+-  if (last_reported_titlebar_frame_ == titlebar_frame) {
+-    return;
++  // A callback may destroy this controller. Copy callbacks and all arguments
++  // before notifying either host, then check liveness before notifying the
++  // next.
++  auto frame_callback = titlebar_frame_changed_callback_;
++  auto reveal_callback = titlebar_reveal_changed_callback_;
++  const double reveal_amount =
++      reveal_callback ? accessory_view_controller_.revealAmount : 0;
++  auto weak_this = weak_ptr_factory_.GetWeakPtr();
++  if (frame_changed) {
++    frame_callback.Run(titlebar_frame);
++  }
++  if (weak_this && reveal_callback) {
++    reveal_callback.Run(unrounded_frame, reveal_amount);
+   }
+-  last_reported_titlebar_frame_ = titlebar_frame;
+-  titlebar_frame_changed_callback_.Run(titlebar_frame);
+ }
+ 
+ }  // namespace remote_cocoa
+diff --git a/components/remote_cocoa/app_shim/immersive_mode_transparent_titlebar_controller_cocoa_unittest.mm b/components/remote_cocoa/app_shim/immersive_mode_transparent_titlebar_controller_cocoa_unittest.mm
+index 91d2f61ce015302327317a0d05210259996ff4ea..39ac6e2243bbe9c15f7daace29d8fc5740841848 100644
+--- a/components/remote_cocoa/app_shim/immersive_mode_transparent_titlebar_controller_cocoa_unittest.mm
++++ b/components/remote_cocoa/app_shim/immersive_mode_transparent_titlebar_controller_cocoa_unittest.mm
+@@ -58,10 +58,15 @@ void TearDown() override {
+   void CreateController() {
+     controller_ =
+         std::make_unique<ImmersiveModeTransparentTitlebarControllerCocoa>(
+-            window_, base::BindRepeating(
+-                         &ImmersiveModeTransparentTitlebarControllerCocoaTest::
+-                             OnTitlebarFrameChanged,
+-                         base::Unretained(this)));
++            window_,
++            base::BindRepeating(
++                &ImmersiveModeTransparentTitlebarControllerCocoaTest::
++                    OnTitlebarFrameChanged,
++                base::Unretained(this)),
++            base::BindRepeating(
++                &ImmersiveModeTransparentTitlebarControllerCocoaTest::
++                    OnTitlebarRevealChanged,
++                base::Unretained(this)));
+     controller_->Init();
+   }
+ 
+@@ -80,6 +85,11 @@ void OnTitlebarFrameChanged(const gfx::Rect& frame) {
+     reported_frames_.push_back(frame);
+   }
+ 
++  void OnTitlebarRevealChanged(const gfx::RectF&, double) {
++    ++reported_reveals_;
++  }
++
++  int reported_reveals_ = 0;
+   NSWindow* __strong window_;
+   std::unique_ptr<ImmersiveModeTransparentTitlebarControllerCocoa> controller_;
+   std::vector<gfx::Rect> reported_frames_;
+@@ -164,6 +174,7 @@ void OnTitlebarFrameChanged(const gfx::Rect& frame) {
+   EXPECT_EQ(nil, controller_->toolbar_window_for_testing());
+   EXPECT_FALSE(controller_->last_reported_titlebar_frame_for_testing());
+   EXPECT_TRUE(reported_frames_.empty());
++  EXPECT_EQ(0, reported_reveals_);
+ }
+ 
+ // ResetTitlebarTransparency() clears a flag left on by a previous fullscreen
