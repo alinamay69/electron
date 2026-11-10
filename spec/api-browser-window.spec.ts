@@ -4039,6 +4039,181 @@ describe('BrowserWindow module', () => {
       const bottomRect = await bottomView.webContents.executeJavaScript('getJSOverlayProperties()');
       expect(bottomRect.y).toBe(0);
       expect(bottomRect.height).toBe(20);
+
+      // Main-process geometry stays in window coordinates, even though each
+      // renderer receives a rectangle clipped to its own moved/resized view.
+      const overlayChanged = once(w, 'window-controls-overlay-changed');
+      const [width, height] = w.getContentSize();
+      w.setContentSize(width + 80, height);
+      const [, windowRect, overlaid] = await overlayChanged;
+      expect(windowRect.y).toBe(0);
+      expect(windowRect.height).toBe(40);
+      expect(windowRect.width).toBeGreaterThan(150);
+      // Reserving space for native controls in a normal window does not mean
+      // that custom chrome is being revealed over other content.
+      expect(overlaid).toBe(false);
+    });
+  });
+
+  describe('fullscreen title bar overlay', () => {
+    const modes = ['native', 'trafficLights'] as const;
+    afterEach(closeAllWindows);
+
+    it('rejects unsupported fullscreen mode values', () => {
+      for (const WindowConstructor of [BaseWindow, BrowserWindow]) {
+        for (const fullscreen of ['invalid', null, false, 1]) {
+          expect(
+            () =>
+              new WindowConstructor({
+                show: false,
+                titleBarStyle: 'hidden',
+                titleBarOverlay: { fullscreen } as Electron.TitleBarOverlay
+              })
+          ).toThrow(TypeError);
+        }
+      }
+    });
+
+    ifdescribe(process.platform !== 'darwin' || !!process.mas)('on unsupported builds', () => {
+      for (const fullscreen of modes) {
+        it(`rejects ${fullscreen} mode`, () => {
+          for (const WindowConstructor of [BaseWindow, BrowserWindow]) {
+            expect(
+              () =>
+                new WindowConstructor({
+                  show: false,
+                  titleBarStyle: 'hidden',
+                  titleBarOverlay: { fullscreen }
+                })
+            ).toThrow(/non-MAS macOS/);
+            if (process.mas) {
+              const w = new WindowConstructor({ show: false, titleBarStyle: 'hidden', titleBarOverlay: true });
+              expect(() => w.setTitleBarOverlay({ fullscreen })).toThrow(/non-MAS macOS/);
+            }
+          }
+        });
+      }
+    });
+
+    ifdescribe(process.platform === 'darwin' && !process.mas)('on macOS', () => {
+      it('requires constructor opt-in before switching fullscreen modes', () => {
+        for (const WindowConstructor of [BaseWindow, BrowserWindow]) {
+          const w = new WindowConstructor({ show: false, titleBarStyle: 'hidden', titleBarOverlay: true });
+          expect(() => w.setTitleBarOverlay({ fullscreen: 'trafficLights' })).toThrow(/not enabled/);
+        }
+      });
+
+      it('requires a supported custom title bar style', () => {
+        for (const titleBarStyle of ['default', 'customButtonsOnHover'] as const) {
+          for (const WindowConstructor of [BaseWindow, BrowserWindow]) {
+            expect(
+              () =>
+                new WindowConstructor({
+                  show: false,
+                  titleBarStyle,
+                  titleBarOverlay: { fullscreen: 'trafficLights' }
+                })
+            ).toThrow(/titleBarStyle/);
+          }
+        }
+      });
+    });
+
+    ifdescribe(process.platform === 'darwin')('native fullscreen', { tags: ['serial'] }, () => {
+      const createWindow = async (
+        fullscreen?: (typeof modes)[number],
+        titleBarStyle: 'hidden' | 'hiddenInset' = 'hidden'
+      ) => {
+        const w = new BrowserWindow({
+          width: 400,
+          height: 400,
+          titleBarStyle,
+          titleBarOverlay: { height: 40, fullscreen },
+          webPreferences: { nodeIntegration: true, contextIsolation: false }
+        });
+        await w.loadFile(path.join(fixtures, 'pages', 'overlay.html'));
+        await waitForOverlay(w);
+        return w;
+      };
+      const setFullscreen = async (w: BrowserWindow, fullscreen: boolean) => {
+        const changed = once(w, fullscreen ? 'enter-full-screen' : 'leave-full-screen');
+        w.setFullScreen(fullscreen);
+        await changed;
+      };
+
+      it('preserves legacy fullscreen behavior when the option is omitted', async () => {
+        const w = await createWindow();
+        await setFullscreen(w, true);
+        await waitUntil(
+          async () => !(await w.webContents.executeJavaScript('navigator.windowControlsOverlay.visible'))
+        );
+        expect(await w.webContents.executeJavaScript('getJSOverlayProperties()')).toEqual({
+          x: 0,
+          y: 0,
+          width: 0,
+          height: 0
+        });
+      });
+
+      ifdescribe(!process.mas)('opt-in modes', () => {
+        for (const [fullscreen, style] of [
+          ['native', 'hidden'],
+          ['trafficLights', 'hiddenInset']
+        ] as const) {
+          it(`keeps ${fullscreen} geometry available across fullscreen transitions`, async () => {
+            const w = await createWindow(fullscreen, style);
+            let overlaid: boolean | undefined;
+            w.on('window-controls-overlay-changed', (_event, _bounds, value) => {
+              overlaid = value;
+            });
+            const initialOverlay = once(w, 'window-controls-overlay-changed');
+            w.setContentSize(420, 400);
+            await initialOverlay;
+            expect(overlaid).toBe(false);
+            for (const enabled of [true, false, true]) {
+              if (!enabled) {
+                // A custom bar can disappear for fullscreen content. Switch to
+                // native controls, then back; the latest explicit visibility
+                // must survive restoring the buttons to their original parent.
+                w.setTitleBarOverlay({ fullscreen: 'native' });
+                w.setWindowButtonVisibility(false);
+                w.setTitleBarOverlay({ fullscreen: 'trafficLights' });
+                w.setWindowButtonVisibility(true);
+                expect(() => w.setTitleBarOverlay({ fullscreen: 'invalid' } as Electron.TitleBarOverlay)).toThrow(
+                  TypeError
+                );
+                expect(() => w.setTitleBarOverlay({})).not.toThrow();
+              }
+              await setFullscreen(w, enabled);
+              await waitForOverlay(w);
+              if (!enabled) {
+                await waitUntil(
+                  async () => (await w.webContents.executeJavaScript('getJSOverlayProperties()')).y === 0
+                );
+              }
+              const jsRect = await w.webContents.executeJavaScript('getJSOverlayProperties()');
+              expect(jsRect.height).toBe(40);
+              expect(jsRect.width).toBeGreaterThan(0);
+              expect(jsRect.y).toBeGreaterThanOrEqual(0);
+              if (!enabled) {
+                expect(jsRect.y).toBe(0);
+                expect(w._getWindowButtonVisibility()).toBe(true);
+                expect(overlaid).toBe(false);
+                w.setTitleBarOverlay({ fullscreen });
+              }
+              expect(await w.webContents.executeJavaScript('getCssOverlayProperties()')).toEqual(jsRect);
+            }
+
+            // Native geometry notifications may synchronously close their
+            // window. Exercise teardown from that callback during restoration.
+            const closed = once(w, 'closed');
+            w.once('window-controls-overlay-changed', () => w.close());
+            w.setFullScreen(false);
+            await closed;
+            expect(overlaid).toBe(false);
+          });
+        }
+      });
     });
   });
 

@@ -63,6 +63,8 @@ class BaseWindow : public gin_helper::TrackableObject<BaseWindow>,
   // window that can't have children.
   static bool IsParentValid(const gin_helper::Dictionary& options,
                             std::string* error_message);
+  static bool IsFullscreenTitlebarValid(const gin_helper::Dictionary& options,
+                                        std::string* error_message);
 
   const NativeWindow* window() const { return window_.get(); }
   NativeWindow* window() { return window_.get(); }
@@ -128,6 +130,7 @@ class BaseWindow : public gin_helper::TrackableObject<BaseWindow>,
   void OnNewWindowForTab() override;
   void OnSystemContextMenu(int x, int y, bool* prevent_default) override;
   void OnWindowStateRestored() override;
+  void UpdateWindowControlsOverlay(const gfx::Rect& bounding_rect) override;
 #if BUILDFLAG(IS_WIN)
   void OnWindowMessage(UINT message, WPARAM w_param, LPARAM l_param) override;
 #endif
@@ -207,10 +210,8 @@ class BaseWindow : public gin_helper::TrackableObject<BaseWindow>,
   v8::Local<v8::Value> GetAccentColor() const;
 #endif
 
-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX)
   void SetTitleBarOverlay(const gin_helper::Dictionary& options,
                           gin::Arguments* args);
-#endif
   [[nodiscard]] constexpr int32_t GetID() const { return weak_map_id(); }
 
  private:

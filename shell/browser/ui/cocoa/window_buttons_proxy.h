@@ -33,6 +33,13 @@
   // Current height of the title bar container.
   float height_;
 
+  // The native titlebar stays in AppKit's fullscreen window. Only its origin
+  // changes while controls slide into the app's custom row.
+  BOOL fullscreen_overlay_;
+  std::optional<double> fullscreen_reveal_;
+  NSView* __weak fullscreen_titlebar_view_;
+  NSPoint fullscreen_titlebar_origin_;
+
   // Track mouse moves above window buttons.
   BOOL show_on_hover_;
   BOOL mouse_inside_;
@@ -54,6 +61,8 @@
 // Set height of button container
 - (void)setHeight:(const float)height;
 - (BOOL)useCustomHeight;
+// A missing reveal amount keeps the system titlebar's layout.
+- (void)setFullscreenOverlay:(BOOL)enabled reveal:(std::optional<double>)reveal;
 
 // Return the bounds of all 3 buttons, with margin on all sides.
 - (NSRect)getButtonsContainerBounds;
